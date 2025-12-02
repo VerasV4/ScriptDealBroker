@@ -248,8 +248,8 @@ def main():
         process_and_save_cards(browser, CREDENTIALS_FILE, SPREADSHEET_ID, TARGET_RANGE, first_run=True)
 
         while True:
-            print("Aguardando 30s...")
-            time.sleep(30)
+            print("Aguardando 2s...")
+            time.sleep(1)
             
             print("Atualizando página...")
             browser.refresh()
