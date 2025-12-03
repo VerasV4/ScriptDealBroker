@@ -21,13 +21,16 @@ from extractor import extrair_dados_leilao
 # 1. CONFIGURAÇÕES GERAIS
 # ──────────────────────────────────────────────────────────────────────────────
 SPREADSHEET_ID   = "1zGQjh1s50gQBlEoEFJiRs5ERfYYqRxSI_YxN4asgQU8"
-TARGET_RANGE     = "dealBroker!A2:I"        # Range ajustado para 9 colunas
+TARGET_RANGE     = "dealBroker!A2:I"
 CREDENTIALS_FILE = "docs-api-call-d7e6aa8d3712.json"
 TARGET_URL       = "https://brokers.mktlab.app/signin"
 LOGIN            = 'jp.azevedo@v4company.com'
 PASSWORD         = 'Peedriinho459!'
 
-# Configuração de Logs
+# Cache Global para evitar leituras repetidas na API
+# Armazena os nomes/IDs dos leads já processados nesta sessão
+PROCESSED_LEADS_CACHE = set()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -35,10 +38,9 @@ logging.basicConfig(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2. FUNÇÕES AUXILIARES (PONTUAÇÃO E WHATSAPP)
+# 2. FUNÇÕES AUXILIARES
 # ──────────────────────────────────────────────────────────────────────────────
 def get_priority_score(faturamento):
-    """Calcula pontuação de prioridade baseado no faturamento."""
     score = 0
     if "400 mil" in faturamento or "milhões" in faturamento:
         score += 30
@@ -47,7 +49,6 @@ def get_priority_score(faturamento):
     return score
 
 def send_lead_to_whatsapp(lead_data):
-    """Envia lead para WhatsApp via API com priorização."""
     url = "https://api.zapsterapi.com/v1/wa/messages"
     
     priority_score = get_priority_score(lead_data.get('faturamento', ''))
@@ -73,21 +74,24 @@ Tempo Restante: {lead_data['tempo_restante']}
     }
     
     headers = {
-        "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3MzczNzI4MzksImlzcyI6InphcHN0ZXJhcGkiLCJzdWIiOiI5NjgyZjg2NC1jMDc5LTQ0YjMtYjhkMC1lOWEzZGJjZTU2MTgiLCJqdGkiOiI3ZjlkMjg2MS04MjdmLTQ2NDQtOGIyZS1kMWQyZTdkNjM3MWQifQ.XBo9IITzeVidiPEV6VPuMdBI-bj7jZ-c_BkKnEGwoLI",
+        "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3MzczNzI4MzksImlzcyI6InphcHN0ZXJhcGkiLCJzdWIiOiI9NjgyZjg2NC1jMDc5LTQ0YjMtYjhkMC1lOWEzZGJjZTU2MTgiLCJqdGkiOiI3ZjlkMjg2MS04MjdmLTQ2NDQtOGIyZS1kMWQyZTdkNjM3MWQifQ.XBo9IITzeVidiPEV6VPuMdBI-bj7jZ-c_BkKnEGwoLI",
         "Content-Type": "application/json"
     }
 
     try:
-        response = requests.request("POST", url, json=payload, headers=headers)
-        # print(f"WhatsApp Status: {response.status_code}")
+        requests.request("POST", url, json=payload, headers=headers)
     except Exception as e:
         print(f"Erro ao enviar WhatsApp: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. FUNÇÕES DO GOOGLE SHEETS
 # ──────────────────────────────────────────────────────────────────────────────
-def get_existing_data(credentials_file, spreadsheet_id, range_name):
-    """Lê os dados existentes para evitar duplicatas."""
+def load_initial_cache(credentials_file, spreadsheet_id, range_name):
+    """
+    ### CORREÇÃO:
+    Carrega os dados da planilha APENAS UMA VEZ no início para popular o cache.
+    """
+    print("Carregando histórico da planilha para memória...")
     SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
     creds = Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
     service = build('sheets', 'v4', credentials=creds)
@@ -96,32 +100,43 @@ def get_existing_data(credentials_file, spreadsheet_id, range_name):
         result = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id, range=range_name
         ).execute()
-        return result.get('values', [])
+        rows = result.get('values', [])
+        
+        # Pega a coluna 1 (Nome/ID) de cada linha, remove espaços e adiciona ao SET global
+        for row in rows:
+            if len(row) > 1:
+                # Normaliza para string e remove espaços extras
+                PROCESSED_LEADS_CACHE.add(str(row[1]).strip())
+                
+        print(f"Cache inicializado com {len(PROCESSED_LEADS_CACHE)} leads já existentes.")
+        
     except Exception as e:
-        print(f"Erro ao ler planilha: {e}")
-        return []
+        print(f"ERRO CRÍTICO ao ler planilha inicial: {e}")
+        # Se der erro na leitura inicial, é melhor parar do que duplicar tudo
+        raise e
 
 def append_data_to_sheets(credentials_file, spreadsheet_id, range_name, cards_data):
-    """Grava novas linhas na planilha."""
     SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
     creds = Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
     service = build('sheets', 'v4', credentials=creds)
 
     body = {'values': cards_data}
 
-    service.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range=range_name,
-        valueInputOption="USER_ENTERED",
-        body=body
-    ).execute()
-    print(f"Planilha atualizada: {len(cards_data)} novos registros.")
+    try:
+        service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueInputOption="USER_ENTERED",
+            body=body
+        ).execute()
+        print(f"Planilha atualizada: {len(cards_data)} novos registros.")
+    except Exception as e:
+        print(f"Erro ao gravar na planilha: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 4. AUTOMAÇÃO E LOGIN (SELENIUM)
 # ──────────────────────────────────────────────────────────────────────────────
 def perform_login(browser):
-    """Realiza login e tira print de confirmação."""
     print("Navegando para página de login...")
     browser.get(TARGET_URL)
 
@@ -138,10 +153,7 @@ def perform_login(browser):
             EC.invisibility_of_element_located((By.ID, "email"))
         )
         print("Login realizado com sucesso.")
-        
         time.sleep(5)
-        browser.save_screenshot("login_sucesso.png")
-        print("📸 Print salvo: login_sucesso.png")
 
     except Exception as e:
         print(f"Erro no login: {e}")
@@ -149,9 +161,8 @@ def perform_login(browser):
         raise e
 
 def setup_browser_and_login():
-    """Configura o Chrome Options e inicia o browser."""
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless") # Mude para False se quiser ver a tela
+    options.add_argument("--headless") 
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -170,93 +181,94 @@ def setup_browser_and_login():
     return browser
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. ORQUESTRAÇÃO (PROCESSAR CARDS)
+# 5. ORQUESTRAÇÃO
 # ──────────────────────────────────────────────────────────────────────────────
-def process_and_save_cards(browser, credentials_file, spreadsheet_id, range_name, first_run=False):
+def process_and_save_cards(browser, credentials_file, spreadsheet_id, range_name):
     """
-    Função principal que chama o Extractor, verifica duplicatas e salva no Sheets.
+    Função principal ajustada para usar CACHE local.
     """
     print("Verificando cards na tela...")
 
     try:
-        # Aguarda o carregamento do GRID de cards para garantir que o site carregou
         WebDriverWait(browser, 15).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="cards-grid"]'))
         )
     except Exception:
-        # Se não achar o grid, verifica se a sessão caiu (input de email voltou)
         if len(browser.find_elements(By.ID, "email")) > 0:
             raise Exception("SESSION_EXPIRED")
         print("Nenhum card visível no momento.")
         return
 
-    # 1. CHAMADA AO ARQUIVO EXTERNO (extractor.py)
     extracted_data = extrair_dados_leilao(browser)
     
     if not extracted_data:
         return
 
-    # 2. Lógica de Duplicidade (Baseada no Nome do Lead)
-    existing_sheet_data = get_existing_data(credentials_file, spreadsheet_id, range_name)
-    # Assumindo coluna B (índice 1) como Nome do Lead na planilha
-    existing_titles = [row[1] for row in existing_sheet_data if len(row) > 1]
-
     data_entrada = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
     rows_to_insert = []
 
     for item in extracted_data:
-        nome_lead = item['nome']
+        # ### CORREÇÃO: Normalização do ID (String e Strip)
+        nome_lead = str(item['nome']).strip()
         
-        # Se não é a primeira execução e já existe na planilha, pula
-        if not first_run and nome_lead in existing_titles:
+        # ### CORREÇÃO: Verifica no CACHE (memória) ao invés de ler a planilha
+        if nome_lead in PROCESSED_LEADS_CACHE:
+            # print(f"Lead {nome_lead} já processado. Pulando.")
             continue
 
-        # Se for novo, prepara para enviar e salvar
-        if nome_lead not in existing_titles:
-            # Envia WhatsApp
-            send_lead_to_whatsapp(item)
-            
-            # Monta a linha para o Google Sheets (Ordem das Colunas)
-            # A:Data | B:Nome | C:Tipo | D:Segmento | E:Faturamento | F:Produto | G:Canal | H:Valor | I:Tempo
-            row = [
-                data_entrada,
-                item['nome'],
-                item['tipo'],
-                item['segmento'],
-                item['faturamento'],
-                item['produto'],
-                item['canal'],
-                item['preco'],
-                item['tempo_restante']
-            ]
-            rows_to_insert.append(row)
+        # Se chegou aqui, é novo
+        print(f"NOVO LEAD ENCONTRADO: {nome_lead}")
+        
+        # 1. Adiciona ao cache imediatamente para não duplicar no próximo loop
+        PROCESSED_LEADS_CACHE.add(nome_lead)
+        
+        # 2. Envia WhatsApp
+        send_lead_to_whatsapp(item)
+        
+        # 3. Prepara linha para Planilha
+        row = [
+            data_entrada,
+            nome_lead, # Garante que vai limpo
+            item['tipo'],
+            item['segmento'],
+            item['faturamento'],
+            item['produto'],
+            item['canal'],
+            item['preco'],
+            item['tempo_restante']
+        ]
+        rows_to_insert.append(row)
 
-    # 3. Salvar em lote na planilha
+    # Gravar em lote na planilha apenas os novos
     if rows_to_insert:
         append_data_to_sheets(credentials_file, spreadsheet_id, range_name, rows_to_insert)
     else:
-        print("Sem novos leads para gravar.")
+        print("Sem novos leads ÚNICOS para gravar.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 6. LOOP PRINCIPAL
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
+    # 1. Carrega o cache ANTES de abrir o browser
+    load_initial_cache(CREDENTIALS_FILE, SPREADSHEET_ID, TARGET_RANGE)
+    
+    # 2. Abre Browser
     browser = setup_browser_and_login()
     
     try:
-        # Primeira execução
-        process_and_save_cards(browser, CREDENTIALS_FILE, SPREADSHEET_ID, TARGET_RANGE, first_run=True)
+        # Primeira verificação
+        process_and_save_cards(browser, CREDENTIALS_FILE, SPREADSHEET_ID, TARGET_RANGE)
 
         while True:
             print("Aguardando 2s...")
-            time.sleep(1)
+            time.sleep(2)
             
             print("Atualizando página...")
             browser.refresh()
-            time.sleep(5) # Espera renderizar após refresh
+            time.sleep(5) 
             
             try:
-                process_and_save_cards(browser, CREDENTIALS_FILE, SPREADSHEET_ID, TARGET_RANGE, first_run=False)
+                process_and_save_cards(browser, CREDENTIALS_FILE, SPREADSHEET_ID, TARGET_RANGE)
             except Exception as e:
                 if "SESSION_EXPIRED" in str(e):
                     print("Sessão expirada. Tentando relogar...")
